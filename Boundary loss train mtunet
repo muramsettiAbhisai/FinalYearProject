@@ -1,0 +1,206 @@
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+
+import logging
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.nn.modules.loss import CrossEntropyLoss
+import torchvision
+from utils.utils import DiceLoss
+from torch.utils.data import DataLoader
+from dataset.dataset_ACDC import ACDCdataset, RandomGenerator
+import argparse
+from tqdm import tqdm
+import os
+from torchvision import transforms
+from utils.test_ACDC import inference
+from model.MTUNet import MTUNet
+import numpy as np
+from medpy.metric import dc, hd95
+import torch.nn.functional as F
+
+# Define the Boundary Loss function
+class BoundaryLoss(nn.Module):
+    def __init__(self, num_classes):
+        super(BoundaryLoss, self).__init__()
+        self.num_classes = num_classes
+        
+    def forward(self, pred, target, weight=None):
+        """
+        Calculate boundary loss between prediction and target
+        pred: (B, C, H, W) - prediction tensor
+        target: (B, H, W) - target tensor with class indices
+        """
+        # Apply softmax to prediction for probability distribution
+        pred_soft = F.softmax(pred, dim=1)
+        
+        # Create one-hot encoding of target
+        target_one_hot = F.one_hot(target.long(), self.num_classes).permute(0, 3, 1, 2).float()
+        
+        # Calculate gradients for prediction and target
+        # Using Sobel operators for edge detection
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).cuda()
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).cuda()
+        
+        sobel_x = sobel_x.view(1, 1, 3, 3).repeat(self.num_classes, 1, 1, 1)
+        sobel_y = sobel_y.view(1, 1, 3, 3).repeat(self.num_classes, 1, 1, 1)
+        
+        boundary_loss = 0
+        
+        for i in range(pred_soft.shape[0]):  # Iterate over batch
+            for c in range(self.num_classes):  # Iterate over classes
+                # Extract probability map and ground truth for current class
+                prob_map = pred_soft[i, c].unsqueeze(0).unsqueeze(0)
+                gt_map = target_one_hot[i, c].unsqueeze(0).unsqueeze(0)
+                
+                # Calculate gradients for prediction
+                pred_grad_x = F.conv2d(prob_map, sobel_x[c:c+1], padding=1)
+                pred_grad_y = F.conv2d(prob_map, sobel_y[c:c+1], padding=1)
+                pred_grad = torch.sqrt(pred_grad_x**2 + pred_grad_y**2)
+                
+                # Calculate gradients for target
+                gt_grad_x = F.conv2d(gt_map, sobel_x[c:c+1], padding=1)
+                gt_grad_y = F.conv2d(gt_map, sobel_y[c:c+1], padding=1)
+                gt_grad = torch.sqrt(gt_grad_x**2 + gt_grad_y**2)
+                
+                # Calculate boundary loss for current class
+                class_boundary_loss = F.mse_loss(pred_grad, gt_grad)
+                boundary_loss += class_boundary_loss
+        
+        # Normalize by batch size and number of classes
+        boundary_loss = boundary_loss / (pred_soft.shape[0] * self.num_classes)
+        
+        return boundary_loss
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--batch_size", default=21, help="batch size")
+parser.add_argument("--lr", default=0.0001, help="learning rate")
+parser.add_argument("--max_epochs", default=100)
+parser.add_argument("--img_size", default=224)
+parser.add_argument("--save_path", default="./checkpoint")
+parser.add_argument("--n_gpu", default=1)
+parser.add_argument("--checkpoint", default=None)
+parser.add_argument("--list_dir", default="../dataset/ACDC/lists_ACDC")
+parser.add_argument("--root_dir", default="../dataset/ACDC/")
+parser.add_argument("--volume_path", default="../dataset/ACDC/test")
+parser.add_argument("--z_spacing", default=10)
+parser.add_argument("--num_classes", default=4)
+parser.add_argument('--test_save_dir', default='./predictions', help='saving prediction as nii!')
+parser.add_argument("--patches_size", default=16)
+parser.add_argument("--n_skip", default=1)
+# Add loss weight arguments
+parser.add_argument("--ce_weight", default=0.3, type=float, help="weight for cross entropy loss")
+parser.add_argument("--dice_weight", default=0.3, type=float, help="weight for dice loss")
+parser.add_argument("--boundary_weight", default=0.4, type=float, help="weight for boundary loss")
+args = parser.parse_args()
+
+model=MTUNet(args.num_classes) # 4
+
+if args.checkpoint:
+    model.load_state_dict(torch.load(args.checkpoint))
+
+train_dataset = ACDCdataset(args.root_dir, args.list_dir, split="train", transform=
+                                   transforms.Compose(
+                                   [RandomGenerator(output_size=[args.img_size, args.img_size])]))
+Train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+db_val=ACDCdataset(base_dir=args.root_dir, list_dir=args.list_dir, split="valid")
+valloader=DataLoader(db_val, batch_size=1, shuffle=False)
+db_test =ACDCdataset(base_dir=args.volume_path,list_dir=args.list_dir, split="test")
+testloader = DataLoader(db_test, batch_size=1, shuffle=False)
+
+if args.n_gpu > 1:
+    model = nn.DataParallel(model)
+
+model = model.cuda()
+model.train()
+ce_loss = CrossEntropyLoss()
+dice_loss = DiceLoss(args.num_classes)
+boundary_loss = BoundaryLoss(args.num_classes)  # Initialize boundary loss
+save_interval = args.n_skip  # int(max_epoch/6)
+
+iterator = tqdm(range(0, args.max_epochs), ncols=70)
+iter_num = 0
+
+Loss = []
+Test_Accuracy = []
+
+Best_dcs = 0.8
+logging.basicConfig(level=logging.INFO,
+                   format='%(asctime)s   %(levelname)s   %(message)s')
+
+max_iterations = args.max_epochs * len(Train_loader)
+base_lr = args.lr
+optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=0.0001)
+# optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
+
+def val():
+    logging.info("Validation ===>")
+    dc_sum=0
+    model.eval()
+    for i, val_sampled_batch in enumerate(valloader):
+        val_image_batch, val_label_batch = val_sampled_batch["image"], val_sampled_batch["label"]
+        val_image_batch, val_label_batch = val_image_batch.type(torch.FloatTensor), val_label_batch.type(torch.FloatTensor)
+        val_image_batch, val_label_batch = val_image_batch.cuda().unsqueeze(1), val_label_batch.cuda().unsqueeze(1)
+
+        val_outputs = model(val_image_batch)
+        val_outputs = torch.argmax(torch.softmax(val_outputs, dim=1), dim=1).squeeze(0)
+        dc_sum+=dc(val_outputs.cpu().data.numpy(),val_label_batch[:].cpu().data.numpy())
+    logging.info("avg_dsc: %f" % (dc_sum/len(valloader)))
+    return dc_sum/len(valloader)
+
+
+for epoch in iterator:
+    model.train()
+    train_loss = 0
+    for i_batch, sampled_batch in enumerate(Train_loader):
+        image_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
+        image_batch, label_batch = image_batch.type(torch.FloatTensor), label_batch.type(torch.FloatTensor)
+        image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
+
+        outputs = model(image_batch)
+
+        # Calculate individual losses
+        loss_ce = ce_loss(outputs, label_batch[:].long())
+        loss_dice = dice_loss(outputs, label_batch[:], softmax=True)
+        loss_boundary = boundary_loss(outputs, label_batch[:].long())
+        
+        # Combine losses with weights
+        loss = (args.ce_weight * loss_ce + 
+                args.dice_weight * loss_dice + 
+                args.boundary_weight * loss_boundary)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+        #lr_ = base_lr
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_
+
+        iter_num = iter_num + 1
+
+        logging.info('iteration %d : loss : %f, ce: %f, dice: %f, boundary: %f, lr_: %f' % 
+                     (iter_num, loss.item(), loss_ce.item(), loss_dice.item(), loss_boundary.item(), lr_))
+        train_loss += loss.item()
+    Loss.append(train_loss/len(train_dataset))
+
+    if (epoch + 1) % save_interval == 0:
+        avg_dcs = val()
+        
+        if avg_dcs > Best_dcs:
+            save_mode_path = os.path.join(args.save_path, 'epoch={}_lr={}_avg_dcs={}.pth'.format(epoch, lr_, avg_dcs))
+            torch.save(model.state_dict(), save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
+            Best_dcs = avg_dcs
+
+            avg_dcs, avg_hd = inference(args, model, testloader, args.test_save_dir)
+            Test_Accuracy.append(avg_dcs)
+
+    if epoch >= args.max_epochs - 1:
+        save_mode_path = os.path.join(args.save_path,  'epoch={}_lr={}_avg_dcs={}.pth'.format(epoch, lr_, avg_dcs))
+        torch.save(model.state_dict(), save_mode_path)
+        logging.info("save model to {}".format(save_mode_path))
+        iterator.close()
+        break
