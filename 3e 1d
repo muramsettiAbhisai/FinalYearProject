@@ -1,0 +1,254 @@
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+
+import torch
+from torch import nn
+import torchvision.models as models
+
+class ConvBNReLU(nn.Module):
+    def __init__(self,
+                 c_in,
+                 c_out,
+                 kernel_size,
+                 stride=1,
+                 padding=1,
+                 activation=True):
+        super(ConvBNReLU, self).__init__()
+        self.conv = nn.Conv2d(c_in,
+                              c_out,
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=padding,
+                              bias=False)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.relu = nn.ReLU()
+        self.activation = activation
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        if self.activation:
+            x = self.relu(x)
+        return x
+
+class DoubleConv(nn.Module):
+    def __init__(self, cin, cout):
+        super(DoubleConv, self).__init__()
+        self.conv = nn.Sequential(
+            ConvBNReLU(cin, cout, 3, 1, padding=1),
+            ConvBNReLU(cout, cout, 3, stride=1, padding=1, activation=False))
+        self.conv1 = nn.Conv2d(cout, cout, 1)
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm2d(cout)
+
+    def forward(self, x):
+        x = self.conv(x)
+        h = x
+        x = self.conv1(x)
+        x = self.bn(x)
+        x = h + x
+        x = self.relu(x)
+        return x
+
+class CustomEncoder(nn.Module):
+    def __init__(self, encoder_name, features_only=True):
+        super(CustomEncoder, self).__init__()
+        # Create the encoder backbone
+        if encoder_name == "resnet50":
+            self.encoder = models.resnet50(pretrained=True)
+            self.channels = [64, 256, 512, 1024, 2048]
+        elif encoder_name == "resnet34":
+            self.encoder = models.resnet34(pretrained=True)
+            self.channels = [64, 64, 128, 256, 512]
+        elif encoder_name == "mobilenet_v2":
+            self.encoder = models.mobilenet_v2(pretrained=True)
+            self.features_only = features_only
+            # Corrected channel sizes for MobileNetV2 feature extraction
+            # These should match the actual output channels at each stage
+            self.channels = [32, 24, 32, 96, 1280]  # First channel corrected from 16 to 32
+        else:
+            raise ValueError(f"Unsupported encoder: {encoder_name}")
+        
+        self.encoder_name = encoder_name
+        
+        # Create adapter layers to standardize outputs to our desired dimensions
+        # [64, 64, 128, 256, 512] is our standardized channel sequence
+        self.adapters = nn.ModuleList([
+            ConvBNReLU(self.channels[0], 64, 1, padding=0),
+            ConvBNReLU(self.channels[1], 64, 1, padding=0),
+            ConvBNReLU(self.channels[2], 128, 1, padding=0),
+            ConvBNReLU(self.channels[3], 256, 1, padding=0),
+            ConvBNReLU(self.channels[4], 512, 1, padding=0)
+        ])
+
+    def forward(self, x):
+        if self.encoder_name == "resnet50" or self.encoder_name == "resnet34":
+            # ResNet forward pass
+            features = []
+            x = self.encoder.conv1(x)
+            x = self.encoder.bn1(x)
+            x = self.encoder.relu(x)
+            features.append(self.adapters[0](x))  # 64 -> 64
+            
+            x = self.encoder.maxpool(x)
+            x = self.encoder.layer1(x)
+            features.append(self.adapters[1](x))  # 256/64 -> 64
+            
+            x = self.encoder.layer2(x)
+            features.append(self.adapters[2](x))  # 512/128 -> 128
+            
+            x = self.encoder.layer3(x)
+            features.append(self.adapters[3](x))  # 1024/256 -> 256
+            
+            x = self.encoder.layer4(x)
+            features.append(self.adapters[4](x))  # 2048/512 -> 512
+            
+            return features
+            
+        elif self.encoder_name == "mobilenet_v2":
+            # MobileNetV2 forward pass - modified to extract features correctly
+            features = []
+            
+            # Need to access the exact layers with the correct output channels
+            # First conv layer outputs 32 channels, not 16
+            x = self.encoder.features[0](x)  # First conv - outputs 32 channels
+            features.append(self.adapters[0](x))  # 32 -> 64
+            
+            # Process to the layer that outputs 24 channels
+            x = self.encoder.features[1:4](x)  # inverted residual blocks (1-3)
+            features.append(self.adapters[1](x))  # 24 -> 64
+            
+            # Process to the layer that outputs 32 channels 
+            x = self.encoder.features[4:7](x)  # inverted residual blocks (4-6)
+            features.append(self.adapters[2](x))  # 32 -> 128
+            
+            # Process to the layer that outputs 96 channels
+            x = self.encoder.features[7:14](x)  # inverted residual blocks (7-13)
+            features.append(self.adapters[3](x))  # 96 -> 256
+            
+            # Process to the final layer that outputs 1280 channels
+            x = self.encoder.features[14:](x)  # inverted residual blocks (14-18)
+            features.append(self.adapters[4](x))  # 1280 -> 512
+            
+            return features
+
+# Simple Feature Fusion Module
+class SimpleFusionModule(nn.Module):
+    def __init__(self, in_channels):
+        super(SimpleFusionModule, self).__init__()
+        self.conv = ConvBNReLU(in_channels * 3, in_channels, 1, padding=0)
+        
+    def forward(self, *features):
+        # Make sure all features have the same size
+        sizes = [f.shape[2:] for f in features]
+        target_size = min(sizes, key=lambda s: s[0] * s[1])
+        
+        resized_features = []
+        for f in features:
+            if f.shape[2:] != target_size:
+                f = nn.functional.interpolate(f, size=target_size, mode='bilinear', align_corners=True)
+            resized_features.append(f)
+        
+        # Concatenate and fuse with a 1x1 conv
+        concat_features = torch.cat(resized_features, dim=1)
+        fused = self.conv(concat_features)
+        
+        return fused
+
+class MTUNet(nn.Module):
+    def __init__(self, out_ch=4, in_channels=3):
+        super(MTUNet, self).__init__()
+        
+        # Three different encoders - using simpler models to avoid dimension issues
+        self.encoder1 = CustomEncoder("resnet34")
+        self.encoder2 = CustomEncoder("mobilenet_v2")
+        self.encoder3 = CustomEncoder("resnet50")
+        
+        # Simplified fusion modules
+        self.fusion_modules = nn.ModuleList([
+            SimpleFusionModule(64),  # Scale 1 (1/2)
+            SimpleFusionModule(64),  # Scale 2 (1/4)
+            SimpleFusionModule(128), # Scale 3 (1/8)
+            SimpleFusionModule(256), # Scale 4 (1/16)
+            SimpleFusionModule(512)  # Scale 5 (1/32)
+        ])
+        
+        # Decoder blocks
+        self.decoder_blocks = nn.ModuleList([
+            # From lowest resolution (1/32) to (1/16)
+            nn.Sequential(
+                nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2),
+                DoubleConv(256 + 256, 256)  # Skip connection from level 4
+            ),
+            # From (1/16) to (1/8)
+            nn.Sequential(
+                nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),
+                DoubleConv(128 + 128, 128)  # Skip connection from level 3
+            ),
+            # From (1/8) to (1/4)
+            nn.Sequential(
+                nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+                DoubleConv(64 + 64, 64)     # Skip connection from level 2
+            ),
+            # From (1/4) to (1/2)
+            nn.Sequential(
+                nn.ConvTranspose2d(64, 64, kernel_size=2, stride=2),
+                DoubleConv(64 + 64, 64)     # Skip connection from level 1
+            )
+        ])
+        
+        # Final 1x1 conv to get the output channels
+        self.final_conv = nn.Conv2d(64, out_ch, kernel_size=1)
+        self.in_channels = in_channels
+    
+    def forward(self, x):
+        # Handle single-channel input
+        if x.size(1) == 1 and self.in_channels == 3:
+            x = x.repeat(1, 3, 1, 1)
+        
+        # Get features from each encoder
+        features1 = self.encoder1(x)
+        features2 = self.encoder2(x)
+        features3 = self.encoder3(x)
+        
+        # Fuse features from all encoders at each scale
+        fused_features = []
+        for i in range(5):  # 5 scales
+            fused = self.fusion_modules[i](features1[i], features2[i], features3[i])
+            fused_features.append(fused)
+        
+        # Decoder path with skip connections
+        x = fused_features[4]  # Start with the deepest features
+        
+        for i, decoder_block in enumerate(self.decoder_blocks):
+            skip_features = fused_features[3 - i]  # Use skip connections in reverse order
+            
+            # Check if upsampled features match skip connection dimensions
+            # First part of decoder_block is the transposed conv
+            x = decoder_block[0](x)
+            
+            # Resize if dimensions don't match
+            if x.shape[2:] != skip_features.shape[2:]:
+                x = nn.functional.interpolate(x, size=skip_features.shape[2:], mode='bilinear', align_corners=True)
+            #hara hara mahaaadeeevvv
+            # Concatenate skip connection
+            x = torch.cat([x, skip_features], dim=1)
+            
+            # Apply second part of decoder block (the DoubleConv)
+            x = decoder_block[1](x)
+        
+        # Final upsampling to original input size if needed
+        if x.shape[2:] != x.shape[2] * 2:
+            x = nn.functional.interpolate(x, scale_factor=2, mode='bilinear', align_corners=True)
+        
+        # Final convolution
+        x = self.final_conv(x)
+        
+        return x
+
+# Example usage
+if __name__ == "__main__":
+    model = MTUNet(out_ch=4)
+    x = torch.randn(2, 3, 224, 224)
+    y = model(x)
+    print(y.shape)  # Should be [2, 4, 224, 224]
