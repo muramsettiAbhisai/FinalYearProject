@@ -1,0 +1,238 @@
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+
+import logging
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from dataset.dataset_ACDC import ACDCdataset, RandomGenerator
+import argparse
+from tqdm import tqdm
+import os
+from torchvision import transforms
+from utils.test_ACDC import inference
+from model.MTUNet import MTUNet
+import numpy as np
+from medpy.metric import dc, hd95
+
+# Import or define the Adaptive t-vMF Dice Loss
+class Adaptive_tvMF_DiceLoss(nn.Module):
+    def __init__(self, n_classes):
+        super(Adaptive_tvMF_DiceLoss, self).__init__()
+        self.n_classes = n_classes
+    
+    # one-hot encoding 
+    def _one_hot_encoder(self, input_tensor):
+        tensor_list = []
+        for i in range(self.n_classes):
+            temp_prob = input_tensor == i
+            tensor_list.append(temp_prob.unsqueeze(1))
+        output_tensor = torch.cat(tensor_list, dim=1)
+        return output_tensor.float()
+    
+    # tvmf dice loss
+    def _tvmf_dice_loss(self, score, target, kappa):
+        target = target.float()
+        smooth = 1.0
+        score = torch.nn.functional.normalize(score, p=2, dim=[0,1,2])
+        target = torch.nn.functional.normalize(target, p=2, dim=[0,1,2])
+        cosine = torch.sum(score * target)
+        intersect = (1. + cosine).div(1. + (1.- cosine).mul(kappa)) - 1.
+        loss = (1 - intersect)**2.0
+        return loss
+    
+    # main
+    def forward(self, inputs, target, kappa=None, softmax=True):
+        if softmax:
+            inputs = torch.softmax(inputs, dim=1)
+        target = self._one_hot_encoder(target)
+        assert inputs.size() == target.size(), 'predict {} & target {} shape do not match'.format(inputs.size(), target.size())
+        loss = 0.0
+        for i in range(0, self.n_classes):
+            tvmf_dice = self._tvmf_dice_loss(inputs[:, i], target[:, i], kappa[i])
+            loss += tvmf_dice
+        return loss / self.n_classes
+
+# Function to adjust kappa values based on Dice scores
+def adjust_kappa(dsc_values, alpha=32.0):
+    """
+    Adjusts kappa values based on current Dice scores
+    Higher DSC -> Higher kappa (more strict loss)
+    """
+    return torch.tensor(dsc_values * alpha).cuda()
+
+# Calculate DSC for all classes to adjust kappa
+def calculate_dsc_per_class(model, valloader, num_classes):
+    """
+    Calculate Dice Score Coefficient for each class
+    """
+    model.eval()
+    dsc_values = np.zeros(num_classes)
+    count = np.zeros(num_classes)
+    
+    with torch.no_grad():
+        for i, val_sampled_batch in enumerate(valloader):
+            val_image_batch, val_label_batch = val_sampled_batch["image"], val_sampled_batch["label"]
+            val_image_batch, val_label_batch = val_image_batch.type(torch.FloatTensor), val_label_batch.type(torch.FloatTensor)
+            val_image_batch, val_label_batch = val_image_batch.cuda().unsqueeze(1), val_label_batch.cuda()
+            
+            val_outputs = model(val_image_batch)
+            val_outputs = torch.argmax(torch.softmax(val_outputs, dim=1), dim=1).squeeze(0)
+            
+            # Calculate DSC for each class
+            for c in range(num_classes):
+                pred_c = (val_outputs == c).cpu().data.numpy()
+                gt_c = (val_label_batch == c).cpu().data.numpy()
+                
+                # Only calculate DSC if class exists in ground truth
+                if np.sum(gt_c) > 0:
+                    dsc_values[c] += dc(pred_c, gt_c)
+                    count[c] += 1
+    
+    # Average DSC per class
+    for c in range(num_classes):
+        if count[c] > 0:
+            dsc_values[c] /= count[c]
+    
+    return dsc_values
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--batch_size", default=12, help="batch size")
+parser.add_argument("--lr", default=0.0001, help="learning rate")
+parser.add_argument("--max_epochs", default=100)
+parser.add_argument("--img_size", default=224)
+parser.add_argument("--save_path", default="./checkpoint")
+parser.add_argument("--n_gpu", default=1)
+parser.add_argument("--checkpoint", default=None)
+parser.add_argument("--list_dir", default="../dataset/ACDC/lists_ACDC")
+parser.add_argument("--root_dir", default="../dataset/ACDC/")
+parser.add_argument("--volume_path", default="../dataset/ACDC/test")
+parser.add_argument("--z_spacing", default=10)
+parser.add_argument("--num_classes", default=4)
+parser.add_argument('--test_save_dir', default='./predictions', help='saving prediction as nii!')
+parser.add_argument("--patches_size", default=16)
+parser.add_argument("--n_skip", default=1)
+parser.add_argument("--alpha", default=32.0, help="scaling factor for kappa adjustment")
+args = parser.parse_args()
+
+model = MTUNet(args.num_classes)
+
+if args.checkpoint:
+    model.load_state_dict(torch.load(args.checkpoint))
+
+train_dataset = ACDCdataset(args.root_dir, args.list_dir, split="train", transform=
+                           transforms.Compose(
+                           [RandomGenerator(output_size=[args.img_size, args.img_size])]))
+Train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+db_val = ACDCdataset(base_dir=args.root_dir, list_dir=args.list_dir, split="valid")
+valloader = DataLoader(db_val, batch_size=1, shuffle=False)
+db_test = ACDCdataset(base_dir=args.volume_path, list_dir=args.list_dir, split="test")
+testloader = DataLoader(db_test, batch_size=1, shuffle=False)
+
+if args.n_gpu > 1:
+    model = nn.DataParallel(model)
+
+model = model.cuda()
+model.train()
+
+# Initialize the Adaptive t-vMF Dice Loss
+adaptive_tvmf_dice_loss = Adaptive_tvMF_DiceLoss(args.num_classes)
+
+# Initialize kappa values with reasonable defaults
+# Start with balanced values and let them adapt during training
+kappa_values = torch.ones(args.num_classes).cuda() * 2.0  # Initial value of 2.0 for all classes
+
+save_interval = args.n_skip
+iterator = tqdm(range(0, args.max_epochs), ncols=70)
+iter_num = 0
+
+Loss = []
+Test_Accuracy = []
+Kappa_History = []  # Track kappa values over time
+
+Best_dcs = 0.8
+logging.basicConfig(level=logging.INFO,
+                   format='%(asctime)s   %(levelname)s   %(message)s')
+
+max_iterations = args.max_epochs * len(Train_loader)
+base_lr = args.lr
+optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=0.0001)
+
+def val():
+    logging.info("Validation ===>")
+    dc_sum = 0
+    model.eval()
+    for i, val_sampled_batch in enumerate(valloader):
+        val_image_batch, val_label_batch = val_sampled_batch["image"], val_sampled_batch["label"]
+        val_image_batch, val_label_batch = val_image_batch.type(torch.FloatTensor), val_label_batch.type(torch.FloatTensor)
+        val_image_batch, val_label_batch = val_image_batch.cuda().unsqueeze(1), val_label_batch.cuda().unsqueeze(1)
+
+        val_outputs = model(val_image_batch)
+        val_outputs = torch.argmax(torch.softmax(val_outputs, dim=1), dim=1).squeeze(0)
+        dc_sum += dc(val_outputs.cpu().data.numpy(), val_label_batch[:].cpu().data.numpy())
+    logging.info("avg_dsc: %f" % (dc_sum/len(valloader)))
+    return dc_sum/len(valloader)
+
+for epoch in iterator:
+    model.train()
+    train_loss = 0
+    
+    # Update kappa values every epoch based on class-wise DSC
+    if epoch > 0:  # Skip first epoch
+        dsc_per_class = calculate_dsc_per_class(model, valloader, args.num_classes)
+        kappa_values = adjust_kappa(dsc_per_class, args.alpha)
+        Kappa_History.append(kappa_values.cpu().numpy())
+        logging.info("Kappa values updated: %s" % str(kappa_values.cpu().numpy()))
+    
+    for i_batch, sampled_batch in enumerate(Train_loader):
+        image_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
+        image_batch, label_batch = image_batch.type(torch.FloatTensor), label_batch.type(torch.FloatTensor)
+        image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
+
+        outputs = model(image_batch)
+
+        # Use Adaptive t-vMF Dice Loss instead of combined CE and Dice
+        loss = adaptive_tvmf_dice_loss(outputs, label_batch[:], kappa=kappa_values, softmax=True)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_
+
+        iter_num = iter_num + 1
+
+        logging.info('iteration %d : loss : %f lr_: %f kappa: %s' % 
+                    (iter_num, loss.item(), lr_, str(kappa_values.cpu().numpy())))
+        train_loss += loss.item()
+    
+    Loss.append(train_loss/len(train_dataset))
+
+    if (epoch + 1) % save_interval == 0:
+        avg_dcs = val()
+        
+        if avg_dcs > Best_dcs:
+            save_mode_path = os.path.join(args.save_path, 'epoch={}_lr={}_avg_dcs={}.pth'.format(epoch, lr_, avg_dcs))
+            torch.save(model.state_dict(), save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
+            Best_dcs = avg_dcs
+
+            avg_dcs, avg_hd = inference(args, model, testloader, args.test_save_dir)
+            Test_Accuracy.append(avg_dcs)
+            
+            # Save kappa values with the model
+            kappa_path = os.path.join(args.save_path, 'epoch={}_kappa_values.npy'.format(epoch))
+            np.save(kappa_path, kappa_values.cpu().numpy())
+
+    if epoch >= args.max_epochs - 1:
+        save_mode_path = os.path.join(args.save_path, 'epoch={}_lr={}_avg_dcs={}.pth'.format(epoch, lr_, avg_dcs))
+        torch.save(model.state_dict(), save_mode_path)
+        logging.info("save model to {}".format(save_mode_path))
+        iterator.close()
+        break
+
+# Save kappa history for analysis
+np.save(os.path.join(args.save_path, 'kappa_history.npy'), np.array(Kappa_History))
