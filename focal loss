@@ -1,0 +1,186 @@
+#!/usr/bin/env python
+# -*- coding:utf-8 -*-
+
+import logging
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.nn.modules.loss import CrossEntropyLoss
+import torchvision
+from utils.utils import DiceLoss
+from torch.utils.data import DataLoader
+from dataset.dataset_ACDC import ACDCdataset, RandomGenerator
+import argparse
+from tqdm import tqdm
+import os
+from torchvision import transforms
+from utils.test_ACDC import inference
+from model.MTUNet import MTUNet
+import numpy as np
+from medpy.metric import dc, hd95
+
+# Define Focal Loss class
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2, alpha=None, size_average=True):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        if isinstance(alpha, (float, int)):
+            self.alpha = torch.Tensor([alpha, 1-alpha])
+        if isinstance(alpha, list):
+            self.alpha = torch.Tensor(alpha)
+        self.size_average = size_average
+
+    def forward(self, input, target):
+        if input.dim() > 2:
+            # N,C,H,W => N,C,H*W
+            input = input.view(input.size(0), input.size(1), -1)
+            input = input.transpose(1, 2)  # N,H*W,C
+            input = input.contiguous().view(-1, input.size(2))  # N*H*W,C
+        target = target.view(-1, 1)
+
+        logpt = F.log_softmax(input, dim=1)
+        logpt = logpt.gather(1, target.long())
+        logpt = logpt.view(-1)
+        pt = logpt.exp()
+
+        if self.alpha is not None:
+            if self.alpha.type() != input.data.type():
+                self.alpha = self.alpha.type_as(input.data)
+            at = self.alpha.gather(0, target.long().view(-1))
+            logpt = logpt * at
+
+        loss = -1 * (1-pt)**self.gamma * logpt
+        if self.size_average:
+            return loss.mean()
+        else:
+            return loss.sum()
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--batch_size", default=12, help="batch size")
+parser.add_argument("--lr", default=0.0001, help="learning rate")
+parser.add_argument("--max_epochs", default=150)
+parser.add_argument("--img_size", default=224)
+parser.add_argument("--save_path", default="./checkpoint")
+parser.add_argument("--n_gpu", default=1)
+parser.add_argument("--checkpoint", default=None)
+parser.add_argument("--list_dir", default="../dataset/ACDC/lists_ACDC")
+parser.add_argument("--root_dir", default="../dataset/ACDC/")
+parser.add_argument("--volume_path", default="../dataset/ACDC/test")
+parser.add_argument("--z_spacing", default=10)
+parser.add_argument("--num_classes", default=4)
+parser.add_argument('--test_save_dir', default='./predictions', help='saving prediction as nii!')
+parser.add_argument("--patches_size", default=16)
+parser.add_argument("--n_skip", default=1)
+parser.add_argument("--focal_gamma", default=2.0, type=float, help="gamma parameter for focal loss")
+parser.add_argument("--focal_alpha", default=None, help="alpha parameter for focal loss")
+args = parser.parse_args()
+
+model = MTUNet(args.num_classes) # 4
+
+if args.checkpoint:
+    model.load_state_dict(torch.load(args.checkpoint))
+
+train_dataset = ACDCdataset(args.root_dir, args.list_dir, split="train", transform=
+                                   transforms.Compose(
+                                   [RandomGenerator(output_size=[args.img_size, args.img_size])]))
+Train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+db_val = ACDCdataset(base_dir=args.root_dir, list_dir=args.list_dir, split="valid")
+valloader = DataLoader(db_val, batch_size=1, shuffle=False)
+db_test = ACDCdataset(base_dir=args.volume_path, list_dir=args.list_dir, split="test")
+testloader = DataLoader(db_test, batch_size=1, shuffle=False)
+
+if args.n_gpu > 1:
+    model = nn.DataParallel(model)
+
+model = model.cuda()
+model.train()
+
+# Initialize Focal Loss instead of CE Loss + Dice Loss
+focal_loss = FocalLoss(gamma=args.focal_gamma, alpha=args.focal_alpha)
+dice_loss = DiceLoss(args.num_classes)  # Keep Dice Loss for combined loss approach
+save_interval = args.n_skip  # int(max_epoch/6)
+
+iterator = tqdm(range(0, args.max_epochs), ncols=70)
+iter_num = 0
+
+Loss = []
+Test_Accuracy = []
+
+Best_dcs = 0.8
+logging.basicConfig(level=logging.INFO,
+                   format='%(asctime)s   %(levelname)s   %(message)s')
+
+max_iterations = args.max_epochs * len(Train_loader)
+base_lr = args.lr
+optimizer = optim.Adam(model.parameters(), lr=base_lr, weight_decay=0.0001)
+# optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
+
+def val():
+    logging.info("Validation ===>")
+    dc_sum = 0
+    model.eval()
+    for i, val_sampled_batch in enumerate(valloader):
+        val_image_batch, val_label_batch = val_sampled_batch["image"], val_sampled_batch["label"]
+        val_image_batch, val_label_batch = val_image_batch.type(torch.FloatTensor), val_label_batch.type(torch.FloatTensor)
+        val_image_batch, val_label_batch = val_image_batch.cuda().unsqueeze(1), val_label_batch.cuda().unsqueeze(1)
+
+        val_outputs = model(val_image_batch)
+        val_outputs = torch.argmax(torch.softmax(val_outputs, dim=1), dim=1).squeeze(0)
+        dc_sum += dc(val_outputs.cpu().data.numpy(), val_label_batch[:].cpu().data.numpy())
+    logging.info("avg_dsc: %f" % (dc_sum/len(valloader)))
+    return dc_sum/len(valloader)
+
+
+for epoch in iterator:
+    model.train()
+    train_loss = 0
+    for i_batch, sampled_batch in enumerate(Train_loader):
+        image_batch, label_batch = sampled_batch["image"], sampled_batch["label"]
+        image_batch, label_batch = image_batch.type(torch.FloatTensor), label_batch.type(torch.FloatTensor)
+        image_batch, label_batch = image_batch.cuda(), label_batch.cuda()
+
+        outputs = model(image_batch)
+        
+        # Replace CE loss with Focal Loss
+        loss_focal = focal_loss(outputs, label_batch[:].long())
+        loss_dice = dice_loss(outputs, label_batch[:], softmax=True)
+        
+        # Combine Focal Loss and Dice Loss
+        loss = loss_focal * 0.5 + loss_dice * 0.5
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        lr_ = base_lr * (1.0 - iter_num / max_iterations) ** 0.9
+        #lr_ = base_lr
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_
+
+        iter_num = iter_num + 1
+
+        logging.info('iteration %d : loss : %f focal_loss: %f dice_loss: %f lr_: %f' % 
+                    (iter_num, loss.item(), loss_focal.item(), loss_dice.item(), lr_))
+        train_loss += loss.item()
+    Loss.append(train_loss/len(train_dataset))
+
+    if (epoch + 1) % save_interval == 0:
+        avg_dcs = val()
+        
+        if avg_dcs > Best_dcs:
+            save_mode_path = os.path.join(args.save_path, 'epoch={}_lr={}_avg_dcs={}_focal.pth'.format(epoch, lr_, avg_dcs))
+            torch.save(model.state_dict(), save_mode_path)
+            logging.info("save model to {}".format(save_mode_path))
+            Best_dcs = avg_dcs
+
+            avg_dcs, avg_hd = inference(args, model, testloader, args.test_save_dir)
+            Test_Accuracy.append(avg_dcs)
+
+    if epoch >= args.max_epochs - 1:
+        save_mode_path = os.path.join(args.save_path, 'epoch={}_lr={}_avg_dcs={}_focal.pth'.format(epoch, lr_, avg_dcs))
+        torch.save(model.state_dict(), save_mode_path)
+        logging.info("save model to {}".format(save_mode_path))
+        iterator.close()
+        break
