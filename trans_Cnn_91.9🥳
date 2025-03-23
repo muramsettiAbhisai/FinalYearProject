@@ -1,0 +1,473 @@
+import torch
+from torch import nn
+import torch.nn.functional as F
+from einops import rearrange
+
+# Existing utility classes
+class ConvBNReLU(nn.Module):
+    def __init__(self,
+                 c_in,
+                 c_out,
+                 kernel_size,
+                 stride=1,
+                 padding=1,
+                 activation=True):
+        super(ConvBNReLU, self).__init__()
+        self.conv = nn.Conv2d(c_in,
+                              c_out,
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=padding,
+                              bias=False)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.relu = nn.ReLU()
+        self.activation = activation
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        if self.activation:
+            x = self.relu(x)
+        return x
+
+class DoubleConv(nn.Module):
+    def __init__(self, cin, cout):
+        super(DoubleConv, self).__init__()
+        self.conv = nn.Sequential(
+            ConvBNReLU(cin, cout, 3, 1, padding=1),
+            ConvBNReLU(cout, cout, 3, stride=1, padding=1, activation=False))
+        self.conv1 = nn.Conv2d(cout, cout, 1)
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm2d(cout)
+
+    def forward(self, x):
+        x = self.conv(x)
+        h = x
+        x = self.conv1(x)
+        x = self.bn(x)
+        x = h + x
+        x = self.relu(x)
+        return x
+
+# Channel Attention Module
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction_ratio, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // reduction_ratio, in_channels, kernel_size=1)
+        )
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out) * x
+
+# Spatial Attention Module
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size//2)
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = self.conv(out)
+        
+        return self.sigmoid(out) * x
+
+# CBAM: Convolutional Block Attention Module
+class CBAM(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(CBAM, self).__init__()
+        self.channel_att = ChannelAttention(in_channels, reduction_ratio)
+        self.spatial_att = SpatialAttention()
+    
+    def forward(self, x):
+        x = self.channel_att(x)
+        x = self.spatial_att(x)
+        return x
+
+# Simple Transformer Block for feature extraction
+class TransformerBlock(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=64, mlp_dim=None, dropout=0.0):
+        super().__init__()
+        mlp_dim = mlp_dim or dim * 4
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, x):
+        # x shape: (B, C, H, W) -> rearrange to (H*W, B, C) for attention
+        b, c, h, w = x.shape
+        x_flat = rearrange(x, 'b c h w -> (h w) b c')
+        
+        # Self-attention
+        norm_x = self.norm1(x_flat)
+        attn_out, _ = self.attn(norm_x, norm_x, norm_x)
+        x_flat = x_flat + attn_out
+        
+        # MLP
+        x_flat = x_flat + self.mlp(self.norm2(x_flat))
+        
+        # Reshape back
+        x = rearrange(x_flat, '(h w) b c -> b c h w', h=h, w=w)
+        return x
+
+# KNN-based Feature Aggregation
+class KNNFeatureAggregation(nn.Module):
+    def __init__(self, in_channels, k=5):
+        super(KNNFeatureAggregation, self).__init__()
+        self.k = k
+        self.conv = nn.Conv2d(in_channels * 2, in_channels, kernel_size=1)
+        
+    def forward(self, x):
+        b, c, h, w = x.shape
+        
+        # Create feature patches
+        unfold = nn.Unfold(kernel_size=3, padding=1)
+        patches = unfold(x)  # B, C*3*3, H*W
+        patches = patches.view(b, c, 9, h*w)
+        
+        # Get center features
+        x_flat = x.view(b, c, h*w)  # B, C, H*W
+        
+        # Compute feature similarities (simplified KNN approach)
+        center_features = x_flat.unsqueeze(2)  # B, C, 1, H*W
+        similarities = torch.sum((patches - center_features)**2, dim=1)  # B, 9, H*W
+        
+        # Get KNN indices
+        _, knn_idx = torch.topk(similarities, k=min(self.k, 9), dim=1, largest=False)  # B, K, H*W
+        
+        # Aggregate KNN features (efficient implementation)
+        knn_features = torch.zeros(b, c, self.k, h*w).to(x.device)
+        for i in range(b):
+            for j in range(self.k):
+                idx = knn_idx[i, j]  # H*W
+                knn_features[i, :, j] = torch.gather(patches[i].view(c, 9, h*w), 1, 
+                                                    idx.unsqueeze(0).repeat(c, 1, 1)).squeeze(1)
+        
+        # Aggregate by mean
+        knn_features = knn_features.mean(dim=2)  # B, C, H*W
+        
+        # Concatenate original features with KNN aggregated features
+        concat_features = torch.cat([x_flat, knn_features], dim=1)  # B, 2*C, H*W
+        
+        # Transform back to original dimensions
+        out = self.conv(concat_features.view(b, 2*c, h, w))
+        
+        return out
+
+# Multi-level Feature Fusion
+class MultiLevelFeatureFusion(nn.Module):
+    def __init__(self, channels_list):
+        super(MultiLevelFeatureFusion, self).__init__()
+        self.channels_list = channels_list
+        
+        # Create projections to a common channel dimension
+        common_dim = min(channels_list)
+        self.projections = nn.ModuleList([
+            nn.Conv2d(ch, common_dim, kernel_size=1) 
+            for ch in channels_list
+        ])
+        
+        # Final fusion convolution
+        self.fusion_conv = nn.Conv2d(common_dim * len(channels_list), common_dim, kernel_size=1)
+        self.attention = CBAM(common_dim)
+        
+    def forward(self, feature_maps):
+        # Project all feature maps to the same channel dimension
+        projected_features = []
+        
+        for i, feature in enumerate(feature_maps):
+            # Apply projection
+            proj = self.projections[i](feature)
+            
+            # Resize to the largest feature map size
+            target_size = feature_maps[0].shape[2:]
+            if proj.shape[2:] != target_size:
+                proj = F.interpolate(proj, size=target_size, mode='bilinear', align_corners=False)
+                
+            projected_features.append(proj)
+        
+        # Concatenate all projected features
+        fused = torch.cat(projected_features, dim=1)
+        
+        # Apply fusion convolution
+        fused = self.fusion_conv(fused)
+        
+        # Apply attention
+        fused = self.attention(fused)
+        
+        return fused
+
+# Hybrid UNet with Transformer and CNN branches
+class HybridUNet(nn.Module):
+    def __init__(self, in_ch=3, out_ch=4):
+        super(HybridUNet, self).__init__()
+        
+        # Input channel configuration
+        self.in_ch = in_ch
+        
+        # CNN Encoder Branch
+        self.cnn_enc1 = DoubleConv(in_ch, 64)
+        self.pool1 = nn.MaxPool2d(2)
+        self.cnn_enc2 = DoubleConv(64, 128)
+        self.pool2 = nn.MaxPool2d(2)
+        self.cnn_enc3 = DoubleConv(128, 256)
+        self.pool3 = nn.MaxPool2d(2)
+        self.cnn_enc4 = DoubleConv(256, 512)
+        self.pool4 = nn.MaxPool2d(2)
+        
+        # Transformer Encoder Branch (operates at reduced resolution for efficiency)
+        self.transformer_down = nn.Conv2d(in_ch, 64, kernel_size=4, stride=4, padding=0)  # Downsampling
+        self.transformer_pos_embed = nn.Parameter(torch.zeros(1, 64, 56, 56))
+        self.transformer_block1 = TransformerBlock(64, heads=8)
+        self.transformer_block2 = TransformerBlock(128, heads=8)
+        self.transformer_block3 = TransformerBlock(256, heads=8)
+        self.transformer_block4 = TransformerBlock(512, heads=8)
+        
+        # Branch fusion with attention
+        self.fusion1 = CBAM(64)
+        self.fusion2 = CBAM(128)
+        self.fusion3 = CBAM(256)
+        self.fusion4 = CBAM(512)
+        
+        # CNN-Transformer projection layers
+        self.proj1 = nn.Conv2d(64, 64, kernel_size=1)
+        self.proj2 = nn.Conv2d(64, 128, kernel_size=1)
+        self.proj3 = nn.Conv2d(128, 256, kernel_size=1)
+        self.proj4 = nn.Conv2d(256, 512, kernel_size=1)
+        
+        # KNN Feature Aggregation
+        self.knn_feature_agg = KNNFeatureAggregation(512, k=5)
+        
+        # Bottleneck
+        self.bottleneck_cnn = DoubleConv(512, 1024)
+        self.bottleneck_transformer = TransformerBlock(1024, heads=16)
+        self.bottleneck_fusion = CBAM(1024)
+        
+        # Decoder with skip connections
+        self.up1 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
+        self.dec1 = DoubleConv(1024, 512)  # 512 (upsampled) + 512 (skip)
+        self.dec1_attn = CBAM(512)
+        
+        self.up2 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec2 = DoubleConv(512, 256)  # 256 + 256
+        self.dec2_attn = CBAM(256)
+        
+        self.up3 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec3 = DoubleConv(256, 128)  # 128 + 128
+        self.dec3_attn = CBAM(128)
+        
+        self.up4 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec4 = DoubleConv(128, 64)  # 64 + 64
+        self.dec4_attn = CBAM(64)
+        
+        # Multi-level feature fusion
+        self.multi_level_fusion = MultiLevelFeatureFusion([64, 128, 256, 512])
+        
+        # Output layer
+        self.out = nn.Conv2d(64, out_ch, 1)
+        
+        # Initialize transformer position embeddings
+        nn.init.normal_(self.transformer_pos_embed, std=0.02)
+
+    def forward(self, x):
+        # Handle single-channel input by repeating to match in_ch
+        if x.size()[1] == 1 and self.in_ch > 1:
+            x = x.repeat(1, self.in_ch, 1, 1)
+        
+        # CNN Encoder Branch
+        e1_cnn = self.cnn_enc1(x)         # (B, 64, H, W)
+        p1_cnn = self.pool1(e1_cnn)       # (B, 64, H/2, W/2)
+        e2_cnn = self.cnn_enc2(p1_cnn)    # (B, 128, H/2, W/2)
+        p2_cnn = self.pool2(e2_cnn)       # (B, 128, H/4, W/4)
+        e3_cnn = self.cnn_enc3(p2_cnn)    # (B, 256, H/4, W/4)
+        p3_cnn = self.pool3(e3_cnn)       # (B, 256, H/8, W/8)
+        e4_cnn = self.cnn_enc4(p3_cnn)    # (B, 512, H/8, W/8)
+        p4_cnn = self.pool4(e4_cnn)       # (B, 512, H/16, W/16)
+        
+        # Transformer Encoder Branch
+        # Dynamically adjust transformer input based on input size
+        t_h, t_w = x.shape[2] // 4, x.shape[3] // 4
+        
+        # Handle case where image size isn't divisible by 4
+        if x.shape[2] % 4 != 0 or x.shape[3] % 4 != 0:
+            # Pad input to make dimensions divisible by 4
+            pad_h = (4 - x.shape[2] % 4) % 4
+            pad_w = (4 - x.shape[3] % 4) % 4
+            x_padded = F.pad(x, (0, pad_w, 0, pad_h))
+            t = self.transformer_down(x_padded)
+        else:
+            t = self.transformer_down(x)  # (B, 64, H/4, W/4)
+        
+        # Adjust position embedding size to match feature map
+        pos_embed = F.interpolate(self.transformer_pos_embed, size=(t_h, t_w), mode='bilinear', align_corners=False)
+        t = t + pos_embed
+        t1 = self.transformer_block1(t)   # (B, 64, H/4, W/4)
+        
+        # Project and downsample for subsequent transformer blocks
+        t = F.max_pool2d(t1, 2)           # (B, 64, H/8, W/8)
+        t = self.proj2(t)                 # (B, 128, H/8, W/8)
+        t2 = self.transformer_block2(t)   # (B, 128, H/8, W/8)
+        
+        t = F.max_pool2d(t2, 2)           # (B, 128, H/16, W/16)
+        t = self.proj3(t)                 # (B, 256, H/16, W/16)
+        t3 = self.transformer_block3(t)   # (B, 256, H/16, W/16)
+        
+        t = F.max_pool2d(t3, 2)           # (B, 256, H/32, W/32)
+        t = self.proj4(t)                 # (B, 512, H/32, W/32)
+        t4 = self.transformer_block4(t)   # (B, 512, H/32, W/32)
+        
+        # Upsample transformer features to match CNN features
+        t1_up = F.interpolate(t1, size=e1_cnn.shape[2:], mode='bilinear', align_corners=False)
+        t2_up = F.interpolate(t2, size=e2_cnn.shape[2:], mode='bilinear', align_corners=False)
+        t3_up = F.interpolate(t3, size=e3_cnn.shape[2:], mode='bilinear', align_corners=False)
+        t4_up = F.interpolate(t4, size=e4_cnn.shape[2:], mode='bilinear', align_corners=False)
+        
+        # Fuse CNN and Transformer features
+        e1 = self.fusion1(e1_cnn + self.proj1(t1_up))
+        e2 = self.fusion2(e2_cnn + t2_up)
+        e3 = self.fusion3(e3_cnn + t3_up)
+        e4 = self.fusion4(e4_cnn + t4_up)
+        
+        # Apply KNN feature aggregation on the deepest encoder features
+        p4 = self.knn_feature_agg(p4_cnn)
+        
+        # Store encoder features for multi-level fusion
+        encoder_features = [e1, e2, e3, e4]
+        
+        # Bottleneck (combine CNN and Transformer)
+        b_cnn = self.bottleneck_cnn(p4)
+        b_transformer = self.bottleneck_transformer(b_cnn)
+        b = self.bottleneck_fusion(b_cnn + b_transformer)
+        
+        # Decoder with attention-enhanced skip connections
+        u1 = self.up1(b)                  # (B, 512, H/8, W/8)
+        c1 = torch.cat((u1, e4), dim=1)   # (B, 1024, H/8, W/8)
+        d1 = self.dec1(c1)                # (B, 512, H/8, W/8)
+        d1 = self.dec1_attn(d1)
+        
+        u2 = self.up2(d1)                 # (B, 256, H/4, W/4)
+        c2 = torch.cat((u2, e3), dim=1)   # (B, 512, H/4, W/4)
+        d2 = self.dec2(c2)                # (B, 256, H/4, W/4)
+        d2 = self.dec2_attn(d2)
+        
+        u3 = self.up3(d2)                 # (B, 128, H/2, W/2)
+        c3 = torch.cat((u3, e2), dim=1)   # (B, 256, H/2, W/2)
+        d3 = self.dec3(c3)                # (B, 128, H/2, W/2)
+        d3 = self.dec3_attn(d3)
+        
+        u4 = self.up4(d3)                 # (B, 64, H, W)
+        c4 = torch.cat((u4, e1), dim=1)   # (B, 128, H, W)
+        d4 = self.dec4(c4)                # (B, 64, H, W)
+        d4 = self.dec4_attn(d4)
+        
+        # Apply multi-level feature fusion from encoder features
+        mlf = self.multi_level_fusion(encoder_features)
+        
+        # Combine with final decoder output
+        d4 = d4 + F.interpolate(mlf, size=d4.shape[2:], mode='bilinear', align_corners=False)
+        
+        # Output
+        out = self.out(d4)                # (B, out_ch, H, W)
+        return out
+
+
+# Standard UNet for comparison or fallback
+class MTUNet(nn.Module):
+    def __init__(self, in_ch=3, out_ch=4):
+        super(MTUNet, self).__init__()
+        # Encoder
+        self.enc1 = DoubleConv(in_ch, 64)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = DoubleConv(64, 128)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = DoubleConv(128, 256)
+        self.pool3 = nn.MaxPool2d(2)
+        self.enc4 = DoubleConv(256, 512)
+        self.pool4 = nn.MaxPool2d(2)
+        
+        # Bottleneck
+        self.bottleneck = DoubleConv(512, 1024)
+        
+        # Decoder
+        self.up1 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
+        self.dec1 = DoubleConv(1024, 512)  # 512 (upsampled) + 512 (skip)
+        self.up2 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec2 = DoubleConv(512, 256)   # 256 + 256
+        self.up3 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec3 = DoubleConv(256, 128)   # 128 + 128
+        self.up4 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec4 = DoubleConv(128, 64)    # 64 + 64
+        
+        # Output layer
+        self.out = nn.Conv2d(64, out_ch, 1)
+
+    def forward(self, x):
+        # Handle single-channel input by repeating to 3 channels
+        if x.size()[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        
+        # Encoder
+        e1 = self.enc1(x)      # (B, 64, H, W)
+        p1 = self.pool1(e1)    # (B, 64, H/2, W/2)
+        e2 = self.enc2(p1)     # (B, 128, H/2, W/2)
+        p2 = self.pool2(e2)    # (B, 128, H/4, W/4)
+        e3 = self.enc3(p2)     # (B, 256, H/4, W/4)
+        p3 = self.pool3(e3)    # (B, 256, H/8, W/8)
+        e4 = self.enc4(p3)     # (B, 512, H/8, W/8)
+        p4 = self.pool4(e4)    # (B, 512, H/16, W/16)
+        
+        # Bottleneck
+        b = self.bottleneck(p4)  # (B, 1024, H/16, W/16)
+        
+        # Decoder with skip connections
+        u1 = self.up1(b)       # (B, 512, H/8, W/8)
+        c1 = torch.cat((u1, e4), dim=1)  # (B, 1024, H/8, W/8)
+        d1 = self.dec1(c1)     # (B, 512, H/8, W/8)
+        
+        u2 = self.up2(d1)      # (B, 256, H/4, W/4)
+        c2 = torch.cat((u2, e3), dim=1)  # (B, 512, H/4, W/4)
+        d2 = self.dec2(c2)     # (B, 256, H/4, W/4)
+        
+        u3 = self.up3(d2)      # (B, 128, H/2, W/2)
+        c3 = torch.cat((u3, e2), dim=1)  # (B, 256, H/2, W/2)
+        d3 = self.dec3(c3)     # (B, 128, H/2, W/2)
+        
+        u4 = self.up4(d3)      # (B, 64, H, W)
+        c4 = torch.cat((u4, e1), dim=1)  # (B, 128, H, W)
+        d4 = self.dec4(c4)     # (B, 64, H, W)
+        
+        # Output
+        out = self.out(d4)     # (B, out_ch, H, W)
+        return out
+
+# Example usage (for testing)
+if __name__ == "__main__":
+    # Test the HybridUNet model
+    model = HybridUNet(in_ch=1, out_ch=4)  # Adjust in_ch based on your ACDC dataset
+    x = torch.randn(2, 1, 224, 224)  # Example batch of 2 images
+    y = model(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {y.shape}")
+    
+    # Get model size
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {param_count:,}")
