@@ -10,7 +10,7 @@
   save_interval: 1,
   saved_model_directory: 'model_ckpts',
   train_fold: 1,
-  project_name: 'FSG-Net',
+  project_name: 'SAUNet',
   CUDA_VISIBLE_DEVICES: '0',
 
   ### Train Parameters
