@@ -22,7 +22,7 @@
   task: 'segmentation',
   input_space: 'RGB',
   input_channel: 3,
-  input_size: [608, 608],  # [h, w] DRIVE:608, STARE:704, CHASE_DB1:1024, HRF:1344
+  input_size: [704, 704],  # [h, w] DRIVE:608, STARE:704, CHASE_DB1:1024, HRF:1344
   optimizer: 'AdamW',
     lr: 0.001,
     scheduler: 'WarmupCosine',  # ConstantLRSchedule, WarmupCosine
