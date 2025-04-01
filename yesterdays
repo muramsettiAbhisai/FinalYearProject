@@ -1,0 +1,371 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+class ConvBNReLU(nn.Module):
+    def __init__(self, c_in, c_out, kernel_size, stride=1, padding=1, activation=True):
+        super(ConvBNReLU, self).__init__()
+        self.conv = nn.Conv2d(c_in, c_out, kernel_size=kernel_size, stride=stride, padding=padding, bias=False)
+        self.bn = nn.BatchNorm2d(c_out)
+        self.relu = nn.LeakyReLU(inplace=True)
+        self.activation = activation
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        if self.activation:
+            x = self.relu(x)
+        return x
+
+class DoubleConv(nn.Module):
+    def __init__(self, cin, cout):
+        super(DoubleConv, self).__init__()
+        self.conv = nn.Sequential(
+            ConvBNReLU(cin, cout, 3, 1, padding=1),
+            ConvBNReLU(cout, cout, 3, stride=1, padding=1, activation=False))
+        self.conv1 = nn.Conv2d(cout, cout, 1)
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm2d(cout)
+
+    def forward(self, x):
+        x = self.conv(x)
+        h = x
+        x = self.conv1(x)
+        x = self.bn(x)
+        x = h + x
+        x = self.relu(x)
+        return x
+
+class HDCBlock(nn.Module):
+    """Hybrid Dilated Convolution Block"""
+    def __init__(self, in_channels, out_channels):
+        super(HDCBlock, self).__init__()
+        # Using different dilation rates to avoid gridding issues
+        self.conv1 = nn.Conv2d(in_channels, out_channels//4, kernel_size=3, padding=1, dilation=1)
+        self.conv2 = nn.Conv2d(in_channels, out_channels//4, kernel_size=3, padding=2, dilation=2)
+        self.conv3 = nn.Conv2d(in_channels, out_channels//4, kernel_size=3, padding=5, dilation=5)
+        self.conv4 = nn.Conv2d(in_channels, out_channels//4, kernel_size=3, padding=7, dilation=7)
+        
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # 1x1 fusion convolution
+        self.fusion = nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        
+    def forward(self, x):
+        x1 = self.conv1(x)
+        x2 = self.conv2(x)
+        x3 = self.conv3(x)
+        x4 = self.conv4(x)
+        
+        x = torch.cat([x1, x2, x3, x4], dim=1)
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.fusion(x)
+        
+        return x
+
+class FeaturePyramidAttention(nn.Module):
+    """Feature Pyramid Attention - captures multi-scale context"""
+    def __init__(self, in_channels, out_channels):
+        super(FeaturePyramidAttention, self).__init__()
+        # Global pooling branch
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        
+        # Multiple parallel convolutions with different kernel sizes
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        
+        # Pyramid dilated convs
+        self.d_conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, dilation=1, padding=1)
+        self.d_conv2 = nn.Conv2d(in_channels, out_channels, kernel_size=3, dilation=3, padding=3)
+        self.d_conv3 = nn.Conv2d(in_channels, out_channels, kernel_size=3, dilation=5, padding=5)
+        
+        self.fusion = nn.Conv2d(out_channels*5, out_channels, kernel_size=1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x):
+        # Global context representation
+        glob = self.global_pool(x)
+        glob = self.global_conv(glob)
+        glob = F.interpolate(glob, size=x.size()[2:], mode='bilinear', align_corners=True)
+        
+        # Multi-scale feature extraction
+        conv1 = self.conv1(x)
+        d_conv1 = self.d_conv1(x)
+        d_conv2 = self.d_conv2(x)
+        d_conv3 = self.d_conv3(x)
+        
+        # Feature fusion
+        fusion = torch.cat([glob, conv1, d_conv1, d_conv2, d_conv3], dim=1)
+        output = self.fusion(fusion)
+        output = self.bn(output)
+        output = self.relu(output)
+        
+        return output
+
+class SpatialChannelAttention(nn.Module):
+    """Combined spatial and channel attention"""
+    def __init__(self, in_channels, reduction=16):
+        super(SpatialChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # Channel attention
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction, 1),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // reduction, in_channels, 1)
+        )
+        
+        # Spatial attention
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        # Channel attention
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        channel_out = self.sigmoid(avg_out + max_out)
+        x = x * channel_out
+        
+        # Spatial attention
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        spatial_out = torch.cat([avg_out, max_out], dim=1)
+        spatial_out = self.sigmoid(self.conv(spatial_out))
+        
+        return x * spatial_out
+
+class DualAttentionBlock(nn.Module):
+    """Position attention + Channel attention for better feature representation"""
+    def __init__(self, in_channels):
+        super(DualAttentionBlock, self).__init__()
+        self.in_channels = in_channels
+        self.query_conv = nn.Conv2d(in_channels, in_channels//8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels//8, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+        
+        self.softmax = nn.Softmax(dim=-1)
+        
+    def forward(self, x):
+        batch_size, C, H, W = x.size()
+        
+        # Position attention
+        proj_query = self.query_conv(x).view(batch_size, -1, H*W).permute(0, 2, 1)
+        proj_key = self.key_conv(x).view(batch_size, -1, H*W)
+        energy = torch.bmm(proj_query, proj_key)
+        attention = self.softmax(energy)
+        proj_value = self.value_conv(x).view(batch_size, -1, H*W)
+        
+        out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, H, W)
+        
+        out = self.gamma * out + x
+        
+        return out
+
+class AttentionGate(nn.Module):
+    def __init__(self, x_channels, g_channels, out_channels):
+        super(AttentionGate, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(g_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(out_channels)
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(x_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(out_channels)
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(out_channels, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x, g):
+        # Upsample g to match the size of x if needed
+        if g.size()[2:] != x.size()[2:]:
+            g = nn.functional.interpolate(g, size=x.size()[2:], mode='bilinear', align_corners=True)
+            
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+
+class EfficientChannelAttention(nn.Module):
+    """ECA module for efficient channel attention"""
+    def __init__(self, channels, gamma=2, b=1):
+        super(EfficientChannelAttention, self).__init__()
+        # Dynamic kernel size based on channel dimension
+        kernel_size = int(abs(math.log(channels, 2) + b) / gamma)
+        kernel_size = kernel_size if kernel_size % 2 else kernel_size + 1
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=kernel_size, padding=(kernel_size - 1) // 2)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        # Get channel attention weights
+        y = self.avg_pool(x)
+        y = y.squeeze(-1).transpose(-1, -2)
+        y = self.conv(y).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        
+        return x * y.expand_as(x)
+
+class ContextBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ContextBlock, self).__init__()
+        # Enhanced implementation specifically for cardiac segmentation
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        
+        # Multi-scale context extraction with dilated convolutions
+        self.dilations = [1, 2, 4, 8]
+        self.dilated_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels//4, kernel_size=3, padding=d, dilation=d),
+                nn.BatchNorm2d(out_channels//4),
+                nn.ReLU(inplace=True)
+            ) for d in self.dilations
+        ])
+        
+        # Attention refinement
+        self.attention = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels),
+            nn.Sigmoid()
+        )
+        
+        # Final fusion
+        self.fusion = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # Global context
+        context = self.gap(x)
+        attention = self.attention(context)
+        
+        # Multi-scale feature extraction with dilated convolutions
+        dilated_feats = []
+        for conv in self.dilated_convs:
+            dilated_feats.append(conv(x))
+        
+        # Concatenate dilated features
+        out = torch.cat(dilated_feats, dim=1)
+        
+        # Apply attention
+        out = out * attention.expand_as(out)
+        
+        # Final fusion
+        out = self.fusion(out)
+        
+        return out
+
+class MTUNet(nn.Module):
+    def __init__(self, out_ch=4):
+        super(MTUNet, self).__init__()
+        
+        # Encoder
+        self.enc1 = DoubleConv(3, 64)
+        self.pool1 = nn.MaxPool2d(2)
+        self.enc2 = DoubleConv(64, 128)
+        self.pool2 = nn.MaxPool2d(2)
+        self.enc3 = DoubleConv(128, 256)
+        self.pool3 = nn.MaxPool2d(2)
+        self.enc4 = DoubleConv(256, 512)
+        self.pool4 = nn.MaxPool2d(2)
+        
+        # Enhanced bottleneck with hybrid dilated convolutions
+        self.bottleneck = nn.Sequential(
+            DoubleConv(512, 1024),
+            HDCBlock(1024, 1024),
+            SpatialChannelAttention(1024)
+        )
+        
+        # Dual Attention for global context modeling
+        self.dual_attention = DualAttentionBlock(1024)
+        
+        # Enhanced attention gates
+        self.attention1 = AttentionGate(512, 1024, 512)
+        self.attention2 = AttentionGate(256, 512, 256)
+        self.attention3 = AttentionGate(128, 256, 128)
+        self.attention4 = AttentionGate(64, 128, 64)
+        
+        # Decoder with skip connections
+        self.up1 = nn.ConvTranspose2d(1024, 512, 2, stride=2)
+        self.dec1 = DoubleConv(1024, 512)  # 512 + 512 (attentioned)
+        self.up2 = nn.ConvTranspose2d(512, 256, 2, stride=2)
+        self.dec2 = DoubleConv(512, 256)   # 256 + 256
+        self.up3 = nn.ConvTranspose2d(256, 128, 2, stride=2)
+        self.dec3 = DoubleConv(256, 128)   # 128 + 128
+        self.up4 = nn.ConvTranspose2d(128, 64, 2, stride=2)
+        self.dec4 = DoubleConv(128, 64)    # 64 + 64
+        
+        # Enhanced context block with Feature Pyramid Attention
+        self.context_block = FeaturePyramidAttention(64, 64)
+        
+        # Final output layer
+        self.out = nn.Conv2d(64, out_ch, 1)
+
+    def forward(self, x):
+        # Handle single-channel input by repeating to 3 channels
+        if x.size()[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        
+        # Encoder
+        e1 = self.enc1(x)      # (B, 64, H, W)
+        p1 = self.pool1(e1)    # (B, 64, H/2, W/2)
+        
+        e2 = self.enc2(p1)     # (B, 128, H/2, W/2)
+        p2 = self.pool2(e2)    # (B, 128, H/4, W/4)
+        
+        e3 = self.enc3(p2)     # (B, 256, H/4, W/4)
+        p3 = self.pool3(e3)    # (B, 256, H/8, W/8)
+        
+        e4 = self.enc4(p3)     # (B, 512, H/8, W/8)
+        p4 = self.pool4(e4)    # (B, 512, H/16, W/16)
+        
+        # Enhanced bottleneck
+        b = self.bottleneck(p4)  # (B, 1024, H/16, W/16)
+        
+        # Global context modeling with dual attention
+        b = self.dual_attention(b)
+        
+        # Apply attention mechanisms to skip connections
+        a4 = self.attention1(e4, b)
+        a3 = self.attention2(e3, a4)
+        a2 = self.attention3(e2, a3)
+        a1 = self.attention4(e1, a2)
+        
+        # Decoder with attentioned skip connections
+        u1 = self.up1(b)       # (B, 512, H/8, W/8)
+        c1 = torch.cat((u1, a4), dim=1)  # (B, 1024, H/8, W/8)
+        d1 = self.dec1(c1)     # (B, 512, H/8, W/8)
+        
+        u2 = self.up2(d1)      # (B, 256, H/4, W/4)
+        c2 = torch.cat((u2, a3), dim=1)  # (B, 512, H/4, W/4)
+        d2 = self.dec2(c2)     # (B, 256, H/4, W/4)
+        
+        u3 = self.up3(d2)      # (B, 128, H/2, W/2)
+        c3 = torch.cat((u3, a2), dim=1)  # (B, 256, H/2, W/2)
+        d3 = self.dec3(c3)     # (B, 128, H/2, W/2)
+        
+        u4 = self.up4(d3)      # (B, 64, H, W)
+        c4 = torch.cat((u4, a1), dim=1)  # (B, 128, H, W)
+        d4 = self.dec4(c4)     # (B, 64, H, W)
+        
+        # Apply feature pyramid attention for multi-scale context
+        d4 = self.context_block(d4)
+        
+        # Output - maintaining your exact format
+        out = self.out(d4)     # (B, out_ch, H, W)
+        
+        return out
